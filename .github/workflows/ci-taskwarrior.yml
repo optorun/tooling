@@ -1,0 +1,104 @@
+---
+
+name: Build taskwarrior
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Git ref to build. Leave empty to auto-detect'
+        required: false
+#  schedule:
+#    - cron: '0 7 * * *'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      needs_build: ${{ steps.resolve.outputs.needs_build }}
+    steps:
+      - name: Define version to build
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          LATEST=$(curl -sf "https://api.github.com/repos/GothenburgBitFactory/taskwarrior/tags" \
+            | jq -r '.[].name' \
+            | grep -E '^v[0-9]+(\.[0-9]+){2}$' \
+            | sort -V \
+            | tail -1)
+
+          if [ -z "$LATEST" ]; then
+            echo "Failed to resolve latest upstream tag" >&2
+            exit 1
+          fi
+
+          echo "version=$LATEST" >> $GITHUB_OUTPUT
+
+          ALREADY_BUILT=$(gh release list \
+            --repo ${{ github.repository }} \
+            --json tagName \
+            | jq -r '.[].tagName' \
+            | grep -c "^taskwarrior-${LATEST}$" || true)
+
+          if [ "$ALREADY_BUILT" -gt 0 ]; then
+            echo "taskwarrior $LATEST already built, skipping"
+          else
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+            echo "New version detected: $LATEST"
+          fi
+
+  build:
+    needs: check
+#    if: needs.check.outputs.needs_build != ''
+    runs-on: ubuntu-latest
+    container:
+      image: rust:slim-bookworm
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - name: Print version to build
+        run: echo ${{ env.VERSION }}
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y cmake build-essential uuid-dev git python3 pkg-config
+
+      - name: Clone taskwarrior ${{ env.VERSION }}
+        uses: actions/checkout@v7
+        with:
+          repository: GothenburgBitFactory/taskwarrior
+          ref: ${{ env.VERSION }} # Ne fonctionne pas -> a checkout la default branch
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build --parallel $(nproc)
+
+      - name: Package
+        run: |
+          ARTIFACT="taskwarrior-${VERSION}-linux-amd64"
+          mkdir -p dist
+          cp build/src/task dist/${ARTIFACT}
+          chmod 755 dist/${ARTIFACT}
+          sha256sum dist/${ARTIFACT} > dist/${ARTIFACT}.sha256
+          echo "ARTIFACT=${ARTIFACT}" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "taskwarrior-${VERSION}" \
+            dist/${ARTIFACT} \
+            dist/${ARTIFACT}.sha256 \
+            --repo ${{ github.repository }} \
+            --title "taskwarrior ${VERSION}" \
+            --notes "Upstream: https://github.com/GothenburgBitFactory/taskwarrior/releases/tag/${VERSION}"
